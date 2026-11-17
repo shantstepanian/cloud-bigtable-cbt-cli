@@ -64,9 +64,11 @@ type fakeFunctionAdminServer struct {
 	mu         sync.Mutex
 	calls      []recordedAdminCall
 	createReqs []*btapb.CreateFunctionRequest
+	getReqs    []*btapb.GetFunctionRequest
 	getOpReqs  []*longrunningpb.GetOperationRequest
 
 	createFn func(context.Context, *btapb.CreateFunctionRequest) (*longrunningpb.Operation, error)
+	getFn    func(context.Context, *btapb.GetFunctionRequest) (*btapb.Function, error)
 	getOpFn  func(context.Context, *longrunningpb.GetOperationRequest) (*longrunningpb.Operation, error)
 }
 
@@ -106,6 +108,19 @@ func (s *fakeFunctionAdminServer) CreateFunction(ctx context.Context, req *btapb
 		return fn(ctx, req)
 	}
 	return nil, status.Error(codes.Unimplemented, "unexpected CreateFunction")
+}
+
+func (s *fakeFunctionAdminServer) GetFunction(ctx context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error) {
+	s.record(ctx, "GetFunction")
+	cloned := proto.Clone(req).(*btapb.GetFunctionRequest)
+	s.mu.Lock()
+	s.getReqs = append(s.getReqs, cloned)
+	fn := s.getFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, req)
+	}
+	return nil, status.Error(codes.Unimplemented, "unexpected GetFunction")
 }
 
 func (s *fakeFunctionAdminServer) GetOperation(ctx context.Context, req *longrunningpb.GetOperationRequest) (*longrunningpb.Operation, error) {
@@ -997,8 +1012,187 @@ func TestWaitFunctionOperation_ContextDeadlineAbortsBackoffSleep(t *testing.T) {
 	}
 }
 
+// Verify getfunction argument and identifier rejections fail fast with zero outbound gRPC calls.
+func TestRunGetFunction_ValidationErrors_ZeroRPCs(t *testing.T) {
+	srv := &fakeFunctionAdminServer{}
+	api := startFakeFunctionAdminGRPC(t, srv)
+
+	errCases := []struct {
+		name    string
+		args    []string
+		wantSub string
+	}{
+		{
+			name:    "get_no_args_rejected",
+			args:    nil,
+			wantSub: "usage: cbt getfunction",
+		},
+		{
+			name:    "get_too_many_args_rejected",
+			args:    []string{"doc_fn", "extra"},
+			wantSub: "usage: cbt getfunction",
+		},
+		{
+			name:    "get_invalid_function_id_rejected",
+			args:    []string{"BadFunc"},
+			wantSub: "invalid function-id",
+		},
+		{
+			name:    "get_overlong_function_id_rejected",
+			args:    []string{strings.Repeat("f", maxFunctionIdentifierLen+1)},
+			wantSub: "exceeds maximum length",
+		},
+	}
+
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := srv.totalCalls()
+			err := runGetFunction(t.Context(), api, "p", "i", io.Discard, tc.args...)
+			if err == nil {
+				t.Fatalf("runGetFunction(%v) = nil, want error containing %q", tc.args, tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("runGetFunction(%v) error = %q, want substring %q", tc.args, err.Error(), tc.wantSub)
+			}
+			if got := srv.totalCalls() - before; got != 0 {
+				t.Errorf("runGetFunction(%v) outbound gRPC calls = %d, want 0", tc.args, got)
+			}
+		})
+	}
+}
+
+// UT-9 & UT-10a: Verify getfunction WASM metadata rendering with SourceSha256 and Etag.
+func TestRunGetFunction_WASMWithSHA256AndEtag(t *testing.T) {
+	fnPrefix := "projects/my-proj/instances/my-inst/functions/"
+	srv := &fakeFunctionAdminServer{
+		getFn: func(_ context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error) {
+			return &btapb.Function{
+				Name:               req.GetName(),
+				Etag:               `W/"v2"`,
+				DeletionProtection: true,
+				FunctionType: &btapb.Function_WasmFunction_{
+					WasmFunction: &btapb.Function_WasmFunction{
+						Arguments:    []*btapb.Function_Argument{{Name: "doc", DataType: &btapb.Type{Kind: &btapb.Type_BytesType{BytesType: &btapb.Type_Bytes{}}}}},
+						ReturnType:   &btapb.Type{Kind: &btapb.Type_StringType{StringType: &btapb.Type_String{}}},
+						SourceSha256: []byte{0x01, 0x23, 0xab, 0xcd},
+					},
+				},
+			}, nil
+		},
+	}
+	api := startFakeFunctionAdminGRPC(t, srv)
+
+	var out bytes.Buffer
+	if err := runGetFunction(t.Context(), api, "my-proj", "my-inst", &out, "doc_extract_snippet"); err != nil {
+		t.Fatalf("runGetFunction unexpected error: %v", err)
+	}
+	wantName := fnPrefix + "doc_extract_snippet"
+	if gotName := srv.getReqs[0].GetName(); gotName != wantName {
+		t.Errorf("GetFunctionRequest.Name = %q, want %q", gotName, wantName)
+	}
+	getCalls := srv.callsFor("GetFunction")
+	if diff := cmp.Diff([]string{"name=" + url.QueryEscape(wantName)}, getCalls[0].md.Get(xGoogRequestParamsHeader)); diff != "" {
+		t.Errorf("GetFunction x-goog-request-params mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]string{"projects/my-proj"}, getCalls[0].md.Get(googleCloudResourcePrefixHeader)); diff != "" {
+		t.Errorf("GetFunction google-cloud-resource-prefix mismatch (-want +got):\n%s", diff)
+	}
+	wantOut := strings.Join([]string{
+		"Name: " + wantName,
+		"Type: WASM",
+		`Etag: W/"v2"`,
+		"DeletionProtection: true",
+		"Arguments: doc:BYTES",
+		"ReturnType: STRING",
+		"SourceSha256: 0123abcd",
+		"",
+	}, "\n")
+	if diff := cmp.Diff(wantOut, out.String()); diff != "" {
+		t.Errorf("runGetFunction output mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// UT-9b: Verify getfunction omits optional Etag and SourceSha256 lines when empty.
+func TestRunGetFunction_WASMWithoutSHA256OrEtag(t *testing.T) {
+	srv := &fakeFunctionAdminServer{
+		getFn: func(_ context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error) {
+			return &btapb.Function{
+				Name: req.GetName(),
+				FunctionType: &btapb.Function_WasmFunction_{
+					WasmFunction: &btapb.Function_WasmFunction{
+						Arguments:  []*btapb.Function_Argument{{Name: "x", DataType: &btapb.Type{Kind: &btapb.Type_Int32Type{Int32Type: &btapb.Type_Int32{}}}}},
+						ReturnType: &btapb.Type{Kind: &btapb.Type_Int32Type{Int32Type: &btapb.Type_Int32{}}},
+					},
+				},
+			}, nil
+		},
+	}
+	api := startFakeFunctionAdminGRPC(t, srv)
+
+	var out bytes.Buffer
+	if err := runGetFunction(t.Context(), api, "my-proj", "my-inst", &out, "no_sha"); err != nil {
+		t.Fatalf("runGetFunction unexpected error: %v", err)
+	}
+	if strings.Contains(out.String(), "SourceSha256:") || strings.Contains(out.String(), "Etag:") {
+		t.Errorf("runGetFunction output = %q, should omit empty SourceSha256 and Etag", out.String())
+	}
+}
+
+// UT-9c: Verify getfunction formats SqlScalarFunction definitions with ANY and DATE types.
+func TestRunGetFunction_SQLScalarFunction(t *testing.T) {
+	fnPrefix := "projects/my-proj/instances/my-inst/functions/"
+	srv := &fakeFunctionAdminServer{
+		getFn: func(_ context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error) {
+			return &btapb.Function{
+				Name: req.GetName(),
+				FunctionType: &btapb.Function_SqlScalarFunction_{
+					SqlScalarFunction: &btapb.Function_SqlScalarFunction{
+						Arguments:    []*btapb.Function_Argument{{Name: "x", DataType: nil}},
+						ReturnType:   &btapb.Type{Kind: &btapb.Type_DateType{DateType: &btapb.Type_Date{}}},
+						FunctionBody: "DATE_FROM_UNIX_DATE(x)",
+					},
+				},
+			}, nil
+		},
+	}
+	api := startFakeFunctionAdminGRPC(t, srv)
+
+	var out bytes.Buffer
+	if err := runGetFunction(t.Context(), api, "my-proj", "my-inst", &out, "sql_fn"); err != nil {
+		t.Fatalf("runGetFunction unexpected error: %v", err)
+	}
+	wantOut := strings.Join([]string{
+		"Name: " + fnPrefix + "sql_fn",
+		"Type: SQL",
+		"DeletionProtection: false",
+		"Arguments: x:ANY",
+		"ReturnType: DATE",
+		"FunctionBody: DATE_FROM_UNIX_DATE(x)",
+		"",
+	}, "\n")
+	if diff := cmp.Diff(wantOut, out.String()); diff != "" {
+		t.Errorf("runGetFunction SQL output mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// UT-10c: Verify NotFound gRPC error propagation on GetFunction.
+func TestRunGetFunction_StatusErrorPropagation(t *testing.T) {
+	srv := &fakeFunctionAdminServer{
+		getFn: func(_ context.Context, _ *btapb.GetFunctionRequest) (*btapb.Function, error) {
+			return nil, status.Error(codes.NotFound, "function not found")
+		},
+	}
+	api := startFakeFunctionAdminGRPC(t, srv)
+
+	err := runGetFunction(t.Context(), api, "my-proj", "my-inst", io.Discard, "fn_err")
+	if gotCode := status.Code(err); gotCode != codes.NotFound {
+		t.Errorf("status.Code(err) = %v, want %v (err: %v)", gotCode, codes.NotFound, err)
+	}
+}
+
 var allFunctionCommandNames = []string{
 	"createfunction",
+	"getfunction",
 }
 
 // UT-13a: Verify ProjectAndInstanceRequired CheckFlags enforcement for Function Admin commands.
