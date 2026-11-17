@@ -468,6 +468,22 @@ var commands = []struct {
 		Required: ProjectAndInstanceRequired,
 	},
 	{
+		Name: "createfunction",
+		Desc: "Create a user-defined function in the configured instance",
+		do:   doCreateFunction,
+		Usage: "cbt createfunction <function-id> (wasm-file=<path> | body=<sql-expression>) [args=<name>[:<type>][,...]] [return-type=<type>] [deletion-protection=<true|false>]\n\n" +
+			"  function-id             Unique ID for the function ([a-z_][a-z0-9_]*)\n" +
+			"  wasm-file=<path>        Path to the compiled .wasm module for a WASM function (max 10 MiB)\n" +
+			"  body=<sql-expression>   SQL expression body for a SQL scalar function\n" +
+			"  args=<name>[:<type>]    Comma-separated argument definitions (required for wasm-file)\n" +
+			"  return-type=<type>      SQL return type (BYTES, STRING, INT64, INT32, FLOAT64, FLOAT32, BOOL, TIMESTAMP, DATE, or ARRAY<T>; required for wasm-file)\n" +
+			"  deletion-protection     Optional boolean to protect the function against deletion\n\n" +
+			"    Examples:\n" +
+			"      cbt createfunction doc_has_keyword wasm-file=doc_has_keyword.wasm args=payload:BYTES,keyword:STRING return-type=BOOL\n" +
+			"      cbt createfunction add_one body=\"x + 1\" args=x:INT64 return-type=INT64",
+		Required: ProjectAndInstanceRequired,
+	},
+	{
 		Name: "createinstance",
 		Desc: "Create an instance with an initial cluster",
 		do:   doCreateInstance,
@@ -1280,7 +1296,7 @@ var docTemplate = template.Must(template.New("doc").Funcs(template.FuncMap{
 
 // DO NOT EDIT. THIS IS AUTOMATICALLY GENERATED.
 // Run "go generate" to regenerate.
-//go:generate go run cbt.go gcpolicy.go cbtconfig.go valueformatting.go -o cbtdoc.go doc
+//go:generate go run cbt.go gcpolicy.go cbtconfig.go valueformatting.go functions.go -o cbtdoc.go doc
 
 /*
 ` + docIntroTemplate + `

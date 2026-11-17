@@ -14,7 +14,7 @@
 
 // DO NOT EDIT. THIS IS AUTOMATICALLY GENERATED.
 // Run "go generate" to regenerate.
-//go:generate go run cbt.go gcpolicy.go cbtconfig.go valueformatting.go -o cbtdoc.go doc
+//go:generate go run cbt.go gcpolicy.go cbtconfig.go valueformatting.go functions.go -o cbtdoc.go doc
 
 /*
 The `cbt` CLI is a command-line interface that lets you interact with Cloud Bigtable.
@@ -34,6 +34,7 @@ The commands are:
 	createappprofile          Create app profile for an instance
 	createcluster             Create a cluster in the configured instance
 	createfamily              Create a column family
+	createfunction            Create a user-defined function in the configured instance
 	createinstance            Create an instance with an initial cluster
 	createtable               Create a table
 	deleteallrows             Delete all rows
@@ -140,6 +141,23 @@ Usage:
 	cbt createfamily <table-id> <family>
 
 	    Example: cbt createfamily mobile-time-series stats_summary
+
+# Create a user-defined function in the configured instance
+
+Usage:
+
+	cbt createfunction <function-id> (wasm-file=<path> | body=<sql-expression>) [args=<name>[:<type>][,...]] [return-type=<type>] [deletion-protection=<true|false>]
+
+	  function-id             Unique ID for the function ([a-z_][a-z0-9_]*)
+	  wasm-file=<path>        Path to the compiled .wasm module for a WASM function (max 10 MiB)
+	  body=<sql-expression>   SQL expression body for a SQL scalar function
+	  args=<name>[:<type>]    Comma-separated argument definitions (required for wasm-file)
+	  return-type=<type>      SQL return type (BYTES, STRING, INT64, INT32, FLOAT64, FLOAT32, BOOL, TIMESTAMP, DATE, or ARRAY<T>; required for wasm-file)
+	  deletion-protection     Optional boolean to protect the function against deletion
+
+	    Examples:
+	      cbt createfunction doc_has_keyword wasm-file=doc_has_keyword.wasm args=payload:BYTES,keyword:STRING return-type=BOOL
+	      cbt createfunction add_one body="x + 1" args=x:INT64 return-type=INT64
 
 # Create an instance with an initial cluster
 
