@@ -40,6 +40,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 )
 
 const (
@@ -64,6 +65,7 @@ var (
 // polling so CLI commands can be tested hermetically without package-level globals.
 type functionAdminAPI interface {
 	CreateFunction(ctx context.Context, req *btapb.CreateFunctionRequest) (*longrunningpb.Operation, error)
+	UpdateFunction(ctx context.Context, req *btapb.UpdateFunctionRequest) (*longrunningpb.Operation, error)
 	GetFunction(ctx context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error)
 	ListFunctions(ctx context.Context, req *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error)
 	WaitFunctionOperation(ctx context.Context, op *longrunningpb.Operation) (*btapb.Function, error)
@@ -139,6 +141,10 @@ func withRequestParams(ctx context.Context, key, val string) context.Context {
 
 func (c *grpcFunctionAdminClient) CreateFunction(ctx context.Context, req *btapb.CreateFunctionRequest) (*longrunningpb.Operation, error) {
 	return c.admin.CreateFunction(withRequestParams(ctx, "parent", req.GetParent()), req)
+}
+
+func (c *grpcFunctionAdminClient) UpdateFunction(ctx context.Context, req *btapb.UpdateFunctionRequest) (*longrunningpb.Operation, error) {
+	return c.admin.UpdateFunction(withRequestParams(ctx, "function.name", req.GetFunction().GetName()), req)
 }
 
 func (c *grpcFunctionAdminClient) GetFunction(ctx context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error) {
@@ -577,6 +583,145 @@ func runCreateFunction(ctx context.Context, api functionAdminAPI, project, insta
 	return nil
 }
 
+func runUpdateFunction(ctx context.Context, api functionAdminAPI, project, instance string, w io.Writer, args ...string) error {
+	const updateUsage = "usage: cbt updatefunction <function-id> [wasm-file=<path> | body=<sql-expression>] [args=<name>[:<type>],...] [return-type=<type>] [deletion-protection=<true|false>] [etag=<etag>]"
+	if len(args) < 2 {
+		return errors.New(updateUsage)
+	}
+	functionID := args[0]
+	if err := validateFunctionIdentifier(functionID, "function-id"); err != nil {
+		return err
+	}
+	parsed, err := parseArgs(args[1:], []string{"wasm-file", "body", "args", "return-type", "deletion-protection", "etag"})
+	if err != nil {
+		return err
+	}
+
+	wasmPath, hasWasmFile, err := parseNonEmptyOption(parsed, "wasm-file")
+	if err != nil {
+		return err
+	}
+	bodyExpr, hasBody, err := parseNonEmptyOption(parsed, "body")
+	if err != nil {
+		return err
+	}
+	if hasWasmFile && hasBody {
+		return errors.New("cannot specify both \"wasm-file\" and \"body\"")
+	}
+	argsSpec, hasArgs, err := parseNonEmptyOption(parsed, "args")
+	if err != nil {
+		return err
+	}
+	retSpec, hasReturnType, err := parseNonEmptyOption(parsed, "return-type")
+	if err != nil {
+		return err
+	}
+	if (hasArgs || hasReturnType) && !hasWasmFile && !hasBody {
+		return errors.New("updating \"args\" or \"return-type\" requires specifying \"wasm-file\" or \"body\"")
+	}
+
+	fn := &btapb.Function{
+		Name: functionResourceName(project, instance, functionID),
+	}
+	var maskPaths []string
+
+	if hasBody {
+		sqlFn := &btapb.Function_SqlScalarFunction{
+			FunctionBody: bodyExpr,
+		}
+		fn.FunctionType = &btapb.Function_SqlScalarFunction_{SqlScalarFunction: sqlFn}
+		maskPaths = append(maskPaths, "sql_scalar_function.function_body")
+
+		if hasArgs {
+			fnArgs, err := parseSQLFunctionArgs(argsSpec)
+			if err != nil {
+				return err
+			}
+			sqlFn.Arguments = fnArgs
+			maskPaths = append(maskPaths, "sql_scalar_function.arguments")
+		}
+
+		if hasReturnType {
+			var retType *btapb.Type
+			if !strings.EqualFold(strings.TrimSpace(retSpec), "ANY") {
+				retType, err = parseSQLFunctionType(retSpec)
+				if err != nil {
+					return fmt.Errorf("return-type: %w", err)
+				}
+			}
+			sqlFn.ReturnType = retType
+			maskPaths = append(maskPaths, "sql_scalar_function.return_type")
+		}
+	} else if hasWasmFile {
+		wasmBytes, err := readWASMSource(wasmPath)
+		if err != nil {
+			return err
+		}
+		wasmFn := &btapb.Function_WasmFunction{
+			Source: wasmBytes,
+		}
+		fn.FunctionType = &btapb.Function_WasmFunction_{WasmFunction: wasmFn}
+		maskPaths = append(maskPaths, "wasm_function.source")
+
+		if hasArgs {
+			fnArgs, err := parseWASMFunctionArgs(argsSpec)
+			if err != nil {
+				return err
+			}
+			wasmFn.Arguments = fnArgs
+			maskPaths = append(maskPaths, "wasm_function.arguments")
+		}
+
+		if hasReturnType {
+			retType, err := parseWASMFunctionType(retSpec)
+			if err != nil {
+				return fmt.Errorf("return-type: %w", err)
+			}
+			wasmFn.ReturnType = retType
+			maskPaths = append(maskPaths, "wasm_function.return_type")
+		}
+	}
+
+	if dpStr, hasDP, err := parseNonEmptyOption(parsed, "deletion-protection"); err != nil {
+		return err
+	} else if hasDP {
+		dp, err := strconv.ParseBool(dpStr)
+		if err != nil {
+			return fmt.Errorf("parsing deletion-protection %q: %w", dpStr, err)
+		}
+		fn.DeletionProtection = dp
+		maskPaths = append(maskPaths, "deletion_protection")
+	}
+
+	if etagVal, hasEtag, err := parseNonEmptyOption(parsed, "etag"); err != nil {
+		return err
+	} else if hasEtag {
+		fn.Etag = etagVal
+	}
+
+	if len(maskPaths) == 0 {
+		return errors.New("updating function: nothing to update (specify at least one of wasm-file, body, args, return-type, or deletion-protection)")
+	}
+
+	req := &btapb.UpdateFunctionRequest{
+		Function:   fn,
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: maskPaths},
+	}
+
+	baseCtx := withResourcePrefix(ctx, project)
+	op, err := api.UpdateFunction(baseCtx, req)
+	if err != nil {
+		return fmt.Errorf("updating function %q: %w", functionID, err)
+	}
+	updated, err := api.WaitFunctionOperation(baseCtx, op)
+	if err != nil {
+		return fmt.Errorf("updating function %q: %w", functionID, err)
+	}
+	_, sig := describeFunctionKindAndSignature(updated)
+	fmt.Fprintf(w, "Name: %s\nSignature: %s\n", updated.GetName(), sig)
+	return nil
+}
+
 func runListFunctions(ctx context.Context, api functionAdminAPI, project, instance string, w io.Writer, args ...string) error {
 	if len(args) != 0 {
 		return errors.New("usage: cbt listfunctions")
@@ -653,6 +798,12 @@ func runGetFunction(ctx context.Context, api functionAdminAPI, project, instance
 
 func doCreateFunction(ctx context.Context, args ...string) {
 	if err := runCreateFunction(ctx, defaultFunctionAdminAPI(), config.Project, config.Instance, os.Stdout, args...); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func doUpdateFunction(ctx context.Context, args ...string) {
+	if err := runUpdateFunction(ctx, defaultFunctionAdminAPI(), config.Project, config.Instance, os.Stdout, args...); err != nil {
 		log.Fatal(err)
 	}
 }
