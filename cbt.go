@@ -686,6 +686,13 @@ var commands = []struct {
 		Required: ProjectAndInstanceRequired,
 	},
 	{
+		Name:     "listfunctions",
+		Desc:     "List user-defined functions in the configured instance",
+		do:       doListFunctions,
+		Usage:    "cbt listfunctions",
+		Required: ProjectAndInstanceRequired,
+	},
+	{
 		Name:     "listinstances",
 		Desc:     "List instances in a project",
 		do:       doListInstances,

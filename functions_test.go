@@ -17,10 +17,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/url"
 	"os"
@@ -37,6 +45,7 @@ import (
 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -65,11 +74,15 @@ type fakeFunctionAdminServer struct {
 	calls      []recordedAdminCall
 	createReqs []*btapb.CreateFunctionRequest
 	getReqs    []*btapb.GetFunctionRequest
+	listReqs   []*btapb.ListFunctionsRequest
 	getOpReqs  []*longrunningpb.GetOperationRequest
 
-	createFn func(context.Context, *btapb.CreateFunctionRequest) (*longrunningpb.Operation, error)
-	getFn    func(context.Context, *btapb.GetFunctionRequest) (*btapb.Function, error)
-	getOpFn  func(context.Context, *longrunningpb.GetOperationRequest) (*longrunningpb.Operation, error)
+	createFn    func(context.Context, *btapb.CreateFunctionRequest) (*longrunningpb.Operation, error)
+	getFn       func(context.Context, *btapb.GetFunctionRequest) (*btapb.Function, error)
+	listFn      func(context.Context, *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error)
+	getOpFn     func(context.Context, *longrunningpb.GetOperationRequest) (*longrunningpb.Operation, error)
+	listInstFn  func(context.Context, *btapb.ListInstancesRequest) (*btapb.ListInstancesResponse, error)
+	listClustFn func(context.Context, *btapb.ListClustersRequest) (*btapb.ListClustersResponse, error)
 }
 
 func (s *fakeFunctionAdminServer) record(ctx context.Context, method string) {
@@ -123,6 +136,19 @@ func (s *fakeFunctionAdminServer) GetFunction(ctx context.Context, req *btapb.Ge
 	return nil, status.Error(codes.Unimplemented, "unexpected GetFunction")
 }
 
+func (s *fakeFunctionAdminServer) ListFunctions(ctx context.Context, req *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error) {
+	s.record(ctx, "ListFunctions")
+	cloned := proto.Clone(req).(*btapb.ListFunctionsRequest)
+	s.mu.Lock()
+	s.listReqs = append(s.listReqs, cloned)
+	fn := s.listFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, req)
+	}
+	return nil, status.Error(codes.Unimplemented, "unexpected ListFunctions")
+}
+
 func (s *fakeFunctionAdminServer) GetOperation(ctx context.Context, req *longrunningpb.GetOperationRequest) (*longrunningpb.Operation, error) {
 	s.record(ctx, "GetOperation")
 	cloned := proto.Clone(req).(*longrunningpb.GetOperationRequest)
@@ -134,6 +160,28 @@ func (s *fakeFunctionAdminServer) GetOperation(ctx context.Context, req *longrun
 		return fn(ctx, req)
 	}
 	return nil, status.Error(codes.Unimplemented, "unexpected GetOperation")
+}
+
+func (s *fakeFunctionAdminServer) ListInstances(ctx context.Context, req *btapb.ListInstancesRequest) (*btapb.ListInstancesResponse, error) {
+	s.record(ctx, "ListInstances")
+	s.mu.Lock()
+	fn := s.listInstFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, req)
+	}
+	return &btapb.ListInstancesResponse{}, nil
+}
+
+func (s *fakeFunctionAdminServer) ListClusters(ctx context.Context, req *btapb.ListClustersRequest) (*btapb.ListClustersResponse, error) {
+	s.record(ctx, "ListClusters")
+	s.mu.Lock()
+	fn := s.listClustFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, req)
+	}
+	return &btapb.ListClustersResponse{}, nil
 }
 
 func startFakeFunctionAdminGRPC(t *testing.T, srv *fakeFunctionAdminServer) *grpcFunctionAdminClient {
@@ -161,6 +209,63 @@ func startFakeFunctionAdminGRPC(t *testing.T, srv *fakeFunctionAdminServer) *grp
 		_ = conn.Close()
 	})
 	return newGRPCFunctionAdminClient(conn, fastTestBackoff)
+}
+
+func startFakeFunctionAdminTLSServer(t *testing.T, srv *fakeFunctionAdminServer) (addr string, certFile string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey failed: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              []string{"localhost"},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate failed: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("x509.MarshalECPrivateKey failed: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("tls.X509KeyPair failed: %v", err)
+	}
+	certPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
+		t.Fatalf("writing ca.pem failed: %v", err)
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	grpcSrv := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+	})))
+	btapb.RegisterBigtableInstanceAdminServer(grpcSrv, srv)
+	longrunningpb.RegisterOperationsServer(grpcSrv, srv)
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		grpcSrv.Stop()
+		_ = lis.Close()
+	})
+	return lis.Addr().String(), certPath
 }
 
 func writeTempWASMFile(t *testing.T, content []byte) string {
@@ -1190,9 +1295,155 @@ func TestRunGetFunction_StatusErrorPropagation(t *testing.T) {
 	}
 }
 
+// UT-8 & UT-9: Verify listfunctions pagination, single non-duplicated routing headers per page,
+// unexpected positional argument rejection, and formatting of WASM and SQL functions.
+func TestRunListFunctions_PaginationHeadersAndSQLTypes(t *testing.T) {
+	parent := "projects/my-proj/instances/my-inst"
+	pages := map[string]*btapb.ListFunctionsResponse{
+		"": {
+			Functions: []*btapb.Function{
+				{
+					Name: parent + "/functions/doc_has_keyword",
+					FunctionType: &btapb.Function_WasmFunction_{
+						WasmFunction: &btapb.Function_WasmFunction{
+							Arguments: []*btapb.Function_Argument{
+								{Name: "payload", DataType: &btapb.Type{Kind: &btapb.Type_BytesType{BytesType: &btapb.Type_Bytes{}}}},
+								{Name: "keyword", DataType: &btapb.Type{Kind: &btapb.Type_StringType{StringType: &btapb.Type_String{}}}},
+							},
+							ReturnType: &btapb.Type{Kind: &btapb.Type_BoolType{BoolType: &btapb.Type_Bool{}}},
+						},
+					},
+				},
+			},
+			NextPageToken: "tok-2",
+		},
+		"tok-2": {
+			Functions: []*btapb.Function{
+				{
+					Name: parent + "/functions/sql_templated_zero_arg",
+					FunctionType: &btapb.Function_SqlScalarFunction_{
+						SqlScalarFunction: &btapb.Function_SqlScalarFunction{
+							Arguments:    nil,
+							ReturnType:   nil, // Unset/inferred ANY return type.
+							FunctionBody: "CURRENT_DATE()",
+						},
+					},
+				},
+			},
+			NextPageToken: "tok-3",
+		},
+		"tok-3": {
+			Functions: []*btapb.Function{
+				{
+					Name: parent + "/functions/sql_complex_types",
+					FunctionType: &btapb.Function_SqlScalarFunction_{
+						SqlScalarFunction: &btapb.Function_SqlScalarFunction{
+							Arguments: []*btapb.Function_Argument{
+								{Name: "any_in", DataType: nil},
+								{Name: "dt", DataType: &btapb.Type{Kind: &btapb.Type_DateType{DateType: &btapb.Type_Date{}}}},
+								{
+									Name: "rec",
+									DataType: &btapb.Type{
+										Kind: &btapb.Type_StructType{
+											StructType: &btapb.Type_Struct{
+												Fields: []*btapb.Type_Struct_Field{
+													{FieldName: "id", Type: &btapb.Type{Kind: &btapb.Type_Int64Type{Int64Type: &btapb.Type_Int64{}}}},
+													{FieldName: "", Type: &btapb.Type{Kind: &btapb.Type_StringType{StringType: &btapb.Type_String{}}}},
+												},
+											},
+										},
+									},
+								},
+							},
+							ReturnType: &btapb.Type{
+								Kind: &btapb.Type_MapType{
+									MapType: &btapb.Type_Map{
+										KeyType: &btapb.Type{Kind: &btapb.Type_StringType{StringType: &btapb.Type_String{}}},
+										ValueType: &btapb.Type{
+											Kind: &btapb.Type_ArrayType{
+												ArrayType: &btapb.Type_Array{
+													ElementType: &btapb.Type{Kind: &btapb.Type_DateType{DateType: &btapb.Type_Date{}}},
+												},
+											},
+										},
+									},
+								},
+							},
+							FunctionBody: "MAP {}",
+						},
+					},
+				},
+			},
+			NextPageToken: "",
+		},
+	}
+
+	srv := &fakeFunctionAdminServer{
+		listFn: func(_ context.Context, req *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error) {
+			resp, ok := pages[req.GetPageToken()]
+			if !ok {
+				return nil, status.Errorf(codes.InvalidArgument, "unexpected page token %q", req.GetPageToken())
+			}
+			return resp, nil
+		},
+	}
+	api := startFakeFunctionAdminGRPC(t, srv)
+
+	// Reject unexpected positional arguments before issuing any RPC.
+	if err := runListFunctions(t.Context(), api, "my-proj", "my-inst", io.Discard, "extra"); err == nil {
+		t.Fatal("runListFunctions with extra arg succeeded, want error")
+	}
+	if got := srv.totalCalls(); got != 0 {
+		t.Fatalf("outbound gRPC calls after extra arg = %d, want 0", got)
+	}
+
+	var out bytes.Buffer
+	if err := runListFunctions(t.Context(), api, "my-proj", "my-inst", &out); err != nil {
+		t.Fatalf("runListFunctions unexpected error: %v", err)
+	}
+
+	wantTokens := []string{"", "tok-2", "tok-3"}
+	var gotTokens []string
+	for _, r := range srv.listReqs {
+		gotTokens = append(gotTokens, r.GetPageToken())
+	}
+	if diff := cmp.Diff(wantTokens, gotTokens); diff != "" {
+		t.Errorf("ListFunctions page tokens mismatch (-want +got):\n%s", diff)
+	}
+
+	// Verify each page carries exactly one x-goog-request-params and one resource-prefix header.
+	wantParams := []string{"parent=" + url.QueryEscape(parent)}
+	for i, call := range srv.callsFor("ListFunctions") {
+		if diff := cmp.Diff(wantParams, call.md.Get(xGoogRequestParamsHeader)); diff != "" {
+			t.Errorf("ListFunctions[%d] x-goog-request-params mismatch (-want +got):\n%s", i, diff)
+		}
+		if diff := cmp.Diff([]string{"projects/my-proj"}, call.md.Get(googleCloudResourcePrefixHeader)); diff != "" {
+			t.Errorf("ListFunctions[%d] google-cloud-resource-prefix mismatch (-want +got):\n%s", i, diff)
+		}
+	}
+
+	gotOut := out.String()
+	for _, wantLine := range []string{
+		"Function ID",
+		"doc_has_keyword",
+		"WASM",
+		"(payload:BYTES, keyword:STRING) -> BOOL",
+		"sql_templated_zero_arg",
+		"SQL",
+		"() -> ANY",
+		"sql_complex_types",
+		"(any_in:ANY, dt:DATE, rec:STRUCT<id INT64, STRING>) -> MAP<STRING, ARRAY<DATE>>",
+	} {
+		if !strings.Contains(gotOut, wantLine) {
+			t.Errorf("runListFunctions output = %q, missing %q", gotOut, wantLine)
+		}
+	}
+}
+
 var allFunctionCommandNames = []string{
 	"createfunction",
 	"getfunction",
+	"listfunctions",
 }
 
 // UT-13a: Verify ProjectAndInstanceRequired CheckFlags enforcement for Function Admin commands.
@@ -1239,6 +1490,113 @@ func TestCLIFunctionCommands_HelpRendersUsage(t *testing.T) {
 		if !strings.Contains(got, "cbt "+name) {
 			t.Errorf("cbt help %s output = %q, want usage containing %q", name, got, "cbt "+name)
 		}
+	}
+}
+
+// UT-13c & RP-1: Verify cliUserAgent and auth-token wiring on functionAdminConnPool
+// (dialed via gtransport.DialPool to avoid deprecated InstanceAdminClientV2().Connection())
+// alongside getInstanceAdminClient() commands (listinstances, listclusters).
+func TestCLIFunctionCommands_UserAgentAndSharedConfigCompat(t *testing.T) {
+	t.Setenv("BIGTABLE_EMULATOR_HOST", "")
+	srv := &fakeFunctionAdminServer{
+		listFn: func(_ context.Context, _ *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error) {
+			return &btapb.ListFunctionsResponse{
+				Functions: []*btapb.Function{
+					{
+						Name: "projects/ua-proj/instances/ua-inst/functions/fn_ua",
+						FunctionType: &btapb.Function_WasmFunction_{
+							WasmFunction: &btapb.Function_WasmFunction{
+								Arguments:  []*btapb.Function_Argument{{Name: "x", DataType: &btapb.Type{Kind: &btapb.Type_Int64Type{Int64Type: &btapb.Type_Int64{}}}}},
+								ReturnType: &btapb.Type{Kind: &btapb.Type_BoolType{BoolType: &btapb.Type_Bool{}}},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+		listInstFn: func(_ context.Context, _ *btapb.ListInstancesRequest) (*btapb.ListInstancesResponse, error) {
+			return &btapb.ListInstancesResponse{
+				Instances: []*btapb.Instance{{Name: "projects/ua-proj/instances/ua-inst", DisplayName: "UA Instance"}},
+			}, nil
+		},
+		listClustFn: func(_ context.Context, _ *btapb.ListClustersRequest) (*btapb.ListClustersResponse, error) {
+			return &btapb.ListClustersResponse{
+				Clusters: []*btapb.Cluster{{Name: "projects/ua-proj/instances/ua-inst/clusters/c1", Location: "projects/ua-proj/locations/us-central1-a", ServeNodes: 3}},
+			}, nil
+		},
+	}
+	tlsAddr, certPath := startFakeFunctionAdminTLSServer(t, srv)
+
+	origConfig := config
+	origInstAdmin := instanceAdminClient
+	origFnPool := functionAdminConnPool
+	origUserAgent := cliUserAgent
+	t.Cleanup(func() {
+		if instanceAdminClient != nil && instanceAdminClient != origInstAdmin {
+			_ = instanceAdminClient.Close()
+		}
+		if functionAdminConnPool != nil && functionAdminConnPool != origFnPool {
+			_ = functionAdminConnPool.Close()
+		}
+		config = origConfig
+		instanceAdminClient = origInstAdmin
+		functionAdminConnPool = origFnPool
+		cliUserAgent = origUserAgent
+	})
+
+	cfg := &Config{
+		Project:       "ua-proj",
+		Instance:      "ua-inst",
+		AdminEndpoint: tlsAddr,
+		CertFile:      certPath,
+		AccessToken:   "static-test-token",
+		AuthToken:     "iam-authz-token",
+		UserAgent:     "cbt-function-admin-test/1.0",
+		Timeout:       5 * time.Second,
+	}
+	config = cfg
+	instanceAdminClient = nil
+	functionAdminConnPool = nil
+
+	listOut := captureStdout(t, func() {
+		doMain(cfg, []string{"listfunctions"})
+	})
+	if !strings.Contains(listOut, "fn_ua") {
+		t.Errorf("doMain listfunctions output = %q, want fn_ua", listOut)
+	}
+
+	instOut := captureStdout(t, func() {
+		doMain(cfg, []string{"listinstances"})
+	})
+	if !strings.Contains(instOut, "ua-inst") {
+		t.Errorf("doMain listinstances output = %q, want ua-inst", instOut)
+	}
+	clustOut := captureStdout(t, func() {
+		doMain(cfg, []string{"listclusters"})
+	})
+	if !strings.Contains(clustOut, "c1") {
+		t.Errorf("doMain listclusters output = %q, want c1", clustOut)
+	}
+
+	listFnCalls := srv.callsFor("ListFunctions")
+	if len(listFnCalls) != 1 {
+		t.Fatalf("ListFunctions call count = %d, want 1", len(listFnCalls))
+	}
+	uaVals := strings.Join(listFnCalls[0].md.Get("user-agent"), " ")
+	if !strings.Contains(uaVals, "cbt-function-admin-test/1.0") {
+		t.Errorf("ListFunctions user-agent = %q, want substring %q", uaVals, "cbt-function-admin-test/1.0")
+	}
+	if diff := cmp.Diff([]string{"iam-authz-token"}, listFnCalls[0].md.Get("x-goog-iam-authorization-token")); diff != "" {
+		t.Errorf("ListFunctions x-goog-iam-authorization-token mismatch (-want +got):\n%s", diff)
+	}
+
+	if functionAdminConnPool != nil {
+		_ = functionAdminConnPool.Close()
+		functionAdminConnPool = nil
+	}
+	t.Setenv("BIGTABLE_EMULATOR_HOST", "http://127.0.0.1:0")
+	if pool := getFunctionAdminConnPool(); pool == nil {
+		t.Errorf("getFunctionAdminConnPool() with BIGTABLE_EMULATOR_HOST = nil, want non-nil pool")
 	}
 }
 
