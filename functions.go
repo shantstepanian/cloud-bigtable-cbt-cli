@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"cloud.google.com/go/bigtable"
@@ -64,6 +65,7 @@ var (
 type functionAdminAPI interface {
 	CreateFunction(ctx context.Context, req *btapb.CreateFunctionRequest) (*longrunningpb.Operation, error)
 	GetFunction(ctx context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error)
+	ListFunctions(ctx context.Context, req *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error)
 	WaitFunctionOperation(ctx context.Context, op *longrunningpb.Operation) (*btapb.Function, error)
 }
 
@@ -141,6 +143,10 @@ func (c *grpcFunctionAdminClient) CreateFunction(ctx context.Context, req *btapb
 
 func (c *grpcFunctionAdminClient) GetFunction(ctx context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error) {
 	return c.admin.GetFunction(withRequestParams(ctx, "name", req.GetName()), req)
+}
+
+func (c *grpcFunctionAdminClient) ListFunctions(ctx context.Context, req *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error) {
+	return c.admin.ListFunctions(withRequestParams(ctx, "parent", req.GetParent()), req)
 }
 
 // WaitFunctionOperation polls a CreateFunction or UpdateFunction LRO until Done
@@ -571,6 +577,42 @@ func runCreateFunction(ctx context.Context, api functionAdminAPI, project, insta
 	return nil
 }
 
+func runListFunctions(ctx context.Context, api functionAdminAPI, project, instance string, w io.Writer, args ...string) error {
+	if len(args) != 0 {
+		return errors.New("usage: cbt listfunctions")
+	}
+	parent := instanceResourceName(project, instance)
+	prefix := parent + "/functions/"
+	baseCtx := withResourcePrefix(ctx, project)
+
+	var functions []*btapb.Function
+	var pageToken string
+	for {
+		resp, err := api.ListFunctions(baseCtx, &btapb.ListFunctionsRequest{
+			Parent:    parent,
+			PageToken: pageToken,
+		})
+		if err != nil {
+			return fmt.Errorf("listing functions: %w", err)
+		}
+		functions = append(functions, resp.GetFunctions()...)
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			break
+		}
+	}
+
+	tw := tabwriter.NewWriter(w, 10, 8, 4, '\t', 0)
+	fmt.Fprintf(tw, "Function ID\tType\tSignature\n")
+	fmt.Fprintf(tw, "-----------\t----\t---------\n")
+	for _, fn := range functions {
+		id := strings.TrimPrefix(fn.GetName(), prefix)
+		kind, sig := describeFunctionKindAndSignature(fn)
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", id, kind, sig)
+	}
+	return tw.Flush()
+}
+
 func runGetFunction(ctx context.Context, api functionAdminAPI, project, instance string, w io.Writer, args ...string) error {
 	if len(args) != 1 {
 		return errors.New("usage: cbt getfunction <function-id>")
@@ -611,6 +653,12 @@ func runGetFunction(ctx context.Context, api functionAdminAPI, project, instance
 
 func doCreateFunction(ctx context.Context, args ...string) {
 	if err := runCreateFunction(ctx, defaultFunctionAdminAPI(), config.Project, config.Instance, os.Stdout, args...); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func doListFunctions(ctx context.Context, args ...string) {
+	if err := runListFunctions(ctx, defaultFunctionAdminAPI(), config.Project, config.Instance, os.Stdout, args...); err != nil {
 		log.Fatal(err)
 	}
 }

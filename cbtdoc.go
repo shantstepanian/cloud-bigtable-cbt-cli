@@ -52,6 +52,7 @@ The commands are:
 	import                    Batch write many rows based on the input file
 	listappprofile            Lists app profile for an instance
 	listclusters              List clusters in an instance
+	listfunctions             List user-defined functions in the configured instance
 	listinstances             List instances in a project
 	lookup                    Read from a single row
 	ls                        List tables and column families
@@ -329,6 +330,12 @@ Usage:
 Usage:
 
 	cbt listclusters
+
+# List user-defined functions in the configured instance
+
+Usage:
+
+	cbt listfunctions
 
 # List instances in a project
 
