@@ -40,6 +40,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 )
 
@@ -68,6 +69,7 @@ type functionAdminAPI interface {
 	UpdateFunction(ctx context.Context, req *btapb.UpdateFunctionRequest) (*longrunningpb.Operation, error)
 	GetFunction(ctx context.Context, req *btapb.GetFunctionRequest) (*btapb.Function, error)
 	ListFunctions(ctx context.Context, req *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error)
+	DeleteFunction(ctx context.Context, req *btapb.DeleteFunctionRequest) (*emptypb.Empty, error)
 	WaitFunctionOperation(ctx context.Context, op *longrunningpb.Operation) (*btapb.Function, error)
 }
 
@@ -153,6 +155,10 @@ func (c *grpcFunctionAdminClient) GetFunction(ctx context.Context, req *btapb.Ge
 
 func (c *grpcFunctionAdminClient) ListFunctions(ctx context.Context, req *btapb.ListFunctionsRequest) (*btapb.ListFunctionsResponse, error) {
 	return c.admin.ListFunctions(withRequestParams(ctx, "parent", req.GetParent()), req)
+}
+
+func (c *grpcFunctionAdminClient) DeleteFunction(ctx context.Context, req *btapb.DeleteFunctionRequest) (*emptypb.Empty, error) {
+	return c.admin.DeleteFunction(withRequestParams(ctx, "name", req.GetName()), req)
 }
 
 // WaitFunctionOperation polls a CreateFunction or UpdateFunction LRO until Done
@@ -796,6 +802,36 @@ func runGetFunction(ctx context.Context, api functionAdminAPI, project, instance
 	return nil
 }
 
+func runDeleteFunction(ctx context.Context, api functionAdminAPI, project, instance string, args ...string) error {
+	if len(args) < 1 {
+		return errors.New("usage: cbt deletefunction <function-id> [etag=<etag>]")
+	}
+	functionID := args[0]
+	if err := validateFunctionIdentifier(functionID, "function-id"); err != nil {
+		return err
+	}
+	parsed, err := parseArgs(args[1:], []string{"etag"})
+	if err != nil {
+		return err
+	}
+	var etag string
+	if etagVal, hasEtag, err := parseNonEmptyOption(parsed, "etag"); err != nil {
+		return err
+	} else if hasEtag {
+		etag = etagVal
+	}
+
+	baseCtx := withResourcePrefix(ctx, project)
+	_, err = api.DeleteFunction(baseCtx, &btapb.DeleteFunctionRequest{
+		Name: functionResourceName(project, instance, functionID),
+		Etag: etag,
+	})
+	if err != nil {
+		return fmt.Errorf("deleting function %q: %w", functionID, err)
+	}
+	return nil
+}
+
 func doCreateFunction(ctx context.Context, args ...string) {
 	if err := runCreateFunction(ctx, defaultFunctionAdminAPI(), config.Project, config.Instance, os.Stdout, args...); err != nil {
 		log.Fatal(err)
@@ -816,6 +852,12 @@ func doListFunctions(ctx context.Context, args ...string) {
 
 func doGetFunction(ctx context.Context, args ...string) {
 	if err := runGetFunction(ctx, defaultFunctionAdminAPI(), config.Project, config.Instance, os.Stdout, args...); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func doDeleteFunction(ctx context.Context, args ...string) {
+	if err := runDeleteFunction(ctx, defaultFunctionAdminAPI(), config.Project, config.Instance, args...); err != nil {
 		log.Fatal(err)
 	}
 }
