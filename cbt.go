@@ -877,6 +877,16 @@ var commands = []struct {
 		Required: ProjectAndInstanceRequired,
 	},
 	{
+		Name: "updatefunction",
+		Desc: "Update a user-defined function in the configured instance",
+		do:   doUpdateFunction,
+		Usage: "cbt updatefunction <function-id> [wasm-file=<path> | body=<sql-expression>] [args=<name>[:<type>],...] [return-type=<type>] [deletion-protection=<true|false>] [etag=<etag>]\n\n" +
+			"    Examples:\n" +
+			"      cbt updatefunction doc_has_keyword wasm-file=doc_has_keyword.wasm args=payload:BYTES,keyword:STRING return-type=BOOL\n" +
+			"      cbt updatefunction add_one body=\"x + 2\" args=x:INT64 return-type=INT64",
+		Required: ProjectAndInstanceRequired,
+	},
+	{
 		Name:     "version",
 		Desc:     "Print the current cbt version",
 		do:       doVersion,
